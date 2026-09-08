@@ -1,0 +1,34 @@
+name: JFT 5-Minute F&O Scanner
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/5 9-15 * * 1-5"
+      timezone: "Asia/Kolkata"
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run JFT scanner
+        env:
+          DASHBOARD_URL: ${{ secrets.DASHBOARD_URL }}
+          SCANNER_SECRET: ${{ secrets.SCANNER_SECRET }}
+          GROWW_ACCESS_TOKEN: ${{ secrets.GROWW_ACCESS_TOKEN }}
+          GROWW_API_KEY: ${{ secrets.GROWW_API_KEY }}
+          GROWW_API_SECRET: ${{ secrets.GROWW_API_SECRET }}
+          GROWW_TOTP_TOKEN: ${{ secrets.GROWW_TOTP_TOKEN }}
+          GROWW_TOTP_SECRET: ${{ secrets.GROWW_TOTP_SECRET }}
+        run: python scanner.py
