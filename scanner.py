@@ -128,7 +128,7 @@ def previous_trading_day(now):
 
 
 def candle_local_date(candle):
-    """Return the candle's date in India time for both Groww timestamp formats."""
+    """Return the candle's India-local calendar date for all Groww timestamp formats."""
     raw = candle[0]
     if isinstance(raw, (int, float)):
         value = float(raw)
@@ -140,7 +140,8 @@ def candle_local_date(candle):
     try:
         dt = datetime.fromisoformat(text)
     except ValueError:
-        return datetime.strptime(str(raw), "%Y-%m-%d %H:%M:%S").replace(tzinfo=IST)
+        # Groww can return a naive "YYYY-MM-DD HH:MM:SS" timestamp.
+        return datetime.strptime(str(raw), "%Y-%m-%d %H:%M:%S").date()
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=IST)
     else:
