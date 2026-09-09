@@ -28,9 +28,18 @@ class ScannerState(Base):
     __tablename__='scanner_state'
     trade_date: Mapped[str]=mapped_column(String(12),primary_key=True); symbol: Mapped[str]=mapped_column(String(40),primary_key=True); ltp: Mapped[float]=mapped_column(Float,nullable=False); updated_at: Mapped[str]=mapped_column(String(50),nullable=False)
 
+def _fix_url(u):
+    if u.startswith('postgres://'):
+        u = 'postgresql+psycopg2://' + u[len('postgres://'):]
+    elif u.startswith('postgresql://'):
+        u = 'postgresql+psycopg2://' + u[len('postgresql://'):]
+    if '?' not in u:
+        u += '?sslmode=require'
+    return u
+
 def database_url():
     explicit=os.getenv('DATABASE_URL')
-    if explicit: return explicit
+    if explicit: return _fix_url(explicit)
     raw=os.getenv('VCAP_SERVICES')
     if raw:
         data=json.loads(raw)
@@ -38,8 +47,7 @@ def database_url():
             for service in services:
                 c=service.get('credentials',{})
                 uri=c.get('uri') or c.get('url') or c.get('jdbcUrl')
-                if uri:
-                    return uri.replace('postgres://','postgresql+psycopg2://',1).replace('postgresql://','postgresql+psycopg2://',1)
+                if uri: return _fix_url(uri)
                 if c.get('hostname') and c.get('username') and c.get('password'):
                     return f"postgresql+psycopg2://{c['username']}:{c['password']}@{c['hostname']}:{c.get('port',5432)}/{c.get('dbname',c.get('database','postgres'))}"
                 if c.get('host') and c.get('user') and c.get('password'):
