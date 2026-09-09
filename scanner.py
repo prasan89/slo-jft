@@ -20,7 +20,7 @@ TOTP_TOKEN = os.environ.get("GROWW_TOTP_TOKEN", "")
 TOTP_SECRET = os.environ.get("GROWW_TOTP_SECRET", "")
 
 # Reverse-engineered JFT coefficients confirmed against TradingView values.
-# JFT levels are symmetric around the previous session midpoint:
+# JFT levels are symmetric around the previous completed session midpoint:
 #   R3/S3 = midpoint +/- 1.00 * range
 #   R2/S2 = midpoint +/- 0.75 * range
 #   R1/S1 = midpoint +/- 0.29 * range
@@ -30,8 +30,6 @@ INNER = 0.29
 BATCH_SIZE = 50
 WORKERS = 8
 
-# A BTP worker stays alive all day. Keep levels in memory after the first
-# successful load so we do not rebuild ~200 daily candles every 5 minutes.
 LEVELS_CACHE_DATE = None
 LEVELS_CACHE = {}
 
@@ -75,8 +73,6 @@ def get_access_token():
 
 
 def groww_get(path, params):
-    # Authenticate per request so a long-running BTP worker never keeps a
-    # token that expired at Groww's daily expiry time.
     token = get_access_token()
     gh = headers(token)
     for attempt in range(4):
@@ -131,9 +127,33 @@ def previous_trading_day(now):
     return day
 
 
+def candle_local_date(candle):
+    """Return the candle's date in India time for both Groww timestamp formats."""
+    raw = candle[0]
+    if isinstance(raw, (int, float)):
+        value = float(raw)
+        # Be defensive if an API response ever returns epoch milliseconds.
+        if value > 10_000_000_000:
+            value /= 1000.0
+        return datetime.fromtimestamp(value, IST).date()
+    text = str(raw).replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        return datetime.strptime(str(raw), "%Y-%m-%d %H:%M:%S").replace(tzinfo=IST)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=IST)
+    else:
+        dt = dt.astimezone(IST)
+    return dt.date()
+
+
 def daily_levels(symbol, trade_date, prev_date):
     start = f"{trade_date - timedelta(days=10)} 00:00:00"
-    end = f"{trade_date} 00:00:00"
+    # Groww's historical endpoint can return the boundary/current daily candle
+    # even when end_time is midnight. Therefore we explicitly filter by the
+    # candle's India-local trading date instead of blindly taking max(timestamp).
+    end = f"{trade_date} 23:59:59"
     payload = groww_get(
         "/v1/historical/candles",
         {
@@ -149,9 +169,18 @@ def daily_levels(symbol, trade_date, prev_date):
     if not candles:
         raise RuntimeError(f"No daily candle before {trade_date} for {symbol}")
 
-    # Groww may return historical candles newest-first. Always select the
-    # latest completed candle strictly before today's session.
-    candle = max(candles, key=lambda c: float(c[0]))
+    # JFT must use YESTERDAY / the previous completed trading session, never
+    # today's partially formed candle. This is the critical fix for the
+    # dashboard's incorrect Prev High / Prev Low values.
+    completed = [c for c in candles if candle_local_date(c) < trade_date]
+    if not completed:
+        raise RuntimeError(f"No completed daily candle before {trade_date} for {symbol}")
+
+    candle = max(completed, key=lambda c: candle_local_date(c))
+    candle_date = candle_local_date(candle)
+    if candle_date != prev_date:
+        print(f"LEVEL WARNING {symbol}: latest completed candle={candle_date}, expected={prev_date}")
+
     high, low = float(candle[2]), float(candle[3])
     midpoint = (high + low) / 2.0
     rng = high - low
@@ -194,13 +223,10 @@ def dashboard_post(path, payload):
 def load_or_build_levels(universe, trade_date, prev_date):
     global LEVELS_CACHE_DATE, LEVELS_CACHE
     cache_key = str(trade_date)
-
     if LEVELS_CACHE_DATE == cache_key and LEVELS_CACHE:
         return LEVELS_CACHE
 
-    # New worker/day: rebuild all levels from the latest completed daily
-    # candle. This also repairs any stale/wrong levels already stored in DB.
-    print(f"Building {len(universe)} JFT level sets from latest completed daily candles...")
+    print(f"Building {len(universe)} JFT level sets from previous completed daily candles...")
     by_symbol = {}
     with ThreadPoolExecutor(max_workers=WORKERS) as pool:
         futures = {pool.submit(daily_levels, s, trade_date, prev_date): s for s in universe}
