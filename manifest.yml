@@ -9,7 +9,7 @@ applications:
     health-check-type: http
     health-check-http-endpoint: /health
     services:
-      - jft-hana
+      - postgresql-db
     env:
       SCANNER_SECRET: ((SCANNER_SECRET))
 
@@ -22,7 +22,7 @@ applications:
     command: python scanner_worker.py
     health-check-type: process
     services:
-      - jft-hana
+      - postgresql-db
     env:
       DASHBOARD_URL: ((DASHBOARD_URL))
       SCANNER_SECRET: ((SCANNER_SECRET))
