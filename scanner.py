@@ -19,8 +19,12 @@ API_SECRET = os.environ.get("GROWW_API_SECRET", "")
 TOTP_TOKEN = os.environ.get("GROWW_TOTP_TOKEN", "")
 TOTP_SECRET = os.environ.get("GROWW_TOTP_SECRET", "")
 
-# Reverse-engineered JFT R3/S3 coefficients.
-OUTER = 0.96
+# Reverse-engineered JFT coefficients confirmed against TradingView values.
+# JFT levels are symmetric around the previous session midpoint:
+#   R3/S3 = midpoint +/- 1.00 * range
+#   R2/S2 = midpoint +/- 0.75 * range
+#   R1/S1 = midpoint +/- 0.29 * range
+OUTER = 1.00
 MIDDLE = 0.75
 INNER = 0.29
 BATCH_SIZE = 50
@@ -145,9 +149,8 @@ def daily_levels(symbol, trade_date, prev_date):
     if not candles:
         raise RuntimeError(f"No daily candle before {trade_date} for {symbol}")
 
-    # Groww may return historical candles newest-first. The old code used
-    # candles[-1], which selected the oldest candle in the lookback window.
-    # Always select the latest candle strictly before today's session.
+    # Groww may return historical candles newest-first. Always select the
+    # latest completed candle strictly before today's session.
     candle = max(candles, key=lambda c: float(c[0]))
     high, low = float(candle[2]), float(candle[3])
     midpoint = (high + low) / 2.0
