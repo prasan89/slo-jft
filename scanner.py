@@ -1,6 +1,7 @@
 import csv
 import hashlib
 import os
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, time as dtime
@@ -33,14 +34,18 @@ WORKERS = 8
 LEVELS_CACHE_DATE = None
 LEVELS_CACHE = {}
 
+# Groww access-token generation is rate limited. Never generate one token per
+# symbol/thread. One cached token is shared by all scanner workers.
+TOKEN_LOCK = threading.Lock()
+CACHED_ACCESS_TOKEN = None
+
 
 def headers(token):
     return {"Accept": "application/json", "Authorization": f"Bearer {token}", "X-API-VERSION": "1.0"}
 
 
-def get_access_token():
-    if ACCESS_TOKEN:
-        return ACCESS_TOKEN
+def _generate_access_token():
+    """Generate exactly one fresh Groww token from API-key or TOTP credentials."""
     if API_KEY and API_SECRET:
         ts = str(int(time.time()))
         checksum = hashlib.sha256((API_SECRET + ts).encode()).hexdigest()
@@ -55,6 +60,7 @@ def get_access_token():
         if not token:
             raise RuntimeError(f"Groww auth failed: {r.text}")
         return token
+
     if TOTP_TOKEN and TOTP_SECRET:
         import pyotp
         totp = pyotp.TOTP(TOTP_SECRET).now()
@@ -69,26 +75,77 @@ def get_access_token():
         if not token:
             raise RuntimeError(f"Groww TOTP auth failed: {r.text}")
         return token
+
     raise RuntimeError("Set GROWW_ACCESS_TOKEN or Groww API key/secret or TOTP credentials")
+
+
+def get_access_token():
+    """Return a process-wide cached token; authenticate only once per process."""
+    global CACHED_ACCESS_TOKEN
+
+    # A manually generated token is already an access token; never call the
+    # authentication endpoint when it is supplied through the environment.
+    if ACCESS_TOKEN:
+        return ACCESS_TOKEN
+
+    if CACHED_ACCESS_TOKEN:
+        return CACHED_ACCESS_TOKEN
+
+    with TOKEN_LOCK:
+        if CACHED_ACCESS_TOKEN:
+            return CACHED_ACCESS_TOKEN
+        CACHED_ACCESS_TOKEN = _generate_access_token()
+        print("Groww access token generated and cached for scanner process")
+        return CACHED_ACCESS_TOKEN
+
+
+def refresh_access_token(observed_token):
+    """Refresh once after 401, while preventing concurrent worker stampedes."""
+    global CACHED_ACCESS_TOKEN
+
+    if ACCESS_TOKEN:
+        raise RuntimeError(
+            "Groww GROWW_ACCESS_TOKEN was rejected with 401; generate a fresh access token "
+            "or use API key/secret credentials for automatic refresh"
+        )
+
+    with TOKEN_LOCK:
+        # Another worker may already have refreshed it while this worker was
+        # waiting for the lock. Reuse that token instead of authenticating again.
+        if CACHED_ACCESS_TOKEN and CACHED_ACCESS_TOKEN != observed_token:
+            return CACHED_ACCESS_TOKEN
+
+        CACHED_ACCESS_TOKEN = None
+        CACHED_ACCESS_TOKEN = _generate_access_token()
+        print("Groww access token refreshed after 401")
+        return CACHED_ACCESS_TOKEN
 
 
 def groww_get(path, params):
     token = get_access_token()
-    gh = headers(token)
     for attempt in range(4):
+        gh = headers(token)
         r = requests.get(f"{GROWW_BASE}{path}", headers=gh, params=params, timeout=30)
+
         if r.status_code == 401 and (API_KEY and API_SECRET or TOTP_TOKEN and TOTP_SECRET):
-            token = get_access_token()
-            gh = headers(token)
-            r = requests.get(f"{GROWW_BASE}{path}", headers=gh, params=params, timeout=30)
-        if r.status_code == 429:
-            time.sleep(2 ** attempt)
+            token = refresh_access_token(token)
             continue
+
+        if r.status_code == 429:
+            retry_after = r.headers.get("Retry-After")
+            try:
+                delay = float(retry_after) if retry_after else float(2 ** attempt)
+            except ValueError:
+                delay = float(2 ** attempt)
+            time.sleep(min(30.0, max(1.0, delay)))
+            continue
+
         r.raise_for_status()
         data = r.json()
         if data.get("status") != "SUCCESS":
             raise RuntimeError(f"Groww API failure: {data}")
         return data["payload"]
+
     raise RuntimeError(f"Groww rate limit persisted: {path}")
 
 
