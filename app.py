@@ -1,164 +1,116 @@
 import os
-import sqlite3
 from datetime import datetime, timezone
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy import select, func, desc
+from db import session, Signal, JFTLevel, ScannerState
 
-DB_PATH = os.getenv("DB_PATH", "signals.db")
-SCANNER_SECRET = os.getenv("SCANNER_SECRET", "")
-app = FastAPI(title="JFT Signal Dashboard")
-
-
-def db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+SCANNER_SECRET = os.getenv('SCANNER_SECRET','')
+app = FastAPI(title='JFT R3/S3 Scanner', version='2.0')
 
 
-def init_db():
-    conn = db()
-    conn.execute("""CREATE TABLE IF NOT EXISTS signals (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT NOT NULL, side TEXT NOT NULL,
-        entry REAL NOT NULL, stop_loss REAL NOT NULL, r1 REAL, r2 REAL, r3 REAL,
-        s1 REAL, s2 REAL, s3 REAL, ltp REAL, pnl REAL, pnl_pct REAL,
-        status TEXT NOT NULL DEFAULT 'OPEN', timeframe TEXT, signal_time TEXT NOT NULL, created_at TEXT NOT NULL)""")
-    cols = {r[1] for r in conn.execute("PRAGMA table_info(signals)").fetchall()}
-    for col in ("r3", "s3"):
-        if col not in cols:
-            conn.execute(f"ALTER TABLE signals ADD COLUMN {col} REAL")
-    conn.execute("""CREATE TABLE IF NOT EXISTS jft_levels (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, trade_date TEXT NOT NULL, symbol TEXT NOT NULL,
-        prev_high REAL NOT NULL, prev_low REAL NOT NULL, midpoint REAL NOT NULL,
-        r1 REAL NOT NULL, r2 REAL NOT NULL, r3 REAL NOT NULL,
-        s1 REAL NOT NULL, s2 REAL NOT NULL, s3 REAL NOT NULL,
-        UNIQUE(trade_date, symbol))""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS scanner_state (
-        trade_date TEXT NOT NULL, symbol TEXT NOT NULL, ltp REAL NOT NULL,
-        updated_at TEXT NOT NULL, PRIMARY KEY(trade_date, symbol))""")
-    conn.commit(); conn.close()
+def check_secret(request: Request):
+    if SCANNER_SECRET and request.headers.get('X-Scanner-Secret') != SCANNER_SECRET:
+        raise HTTPException(401,'Invalid scanner secret')
 
 
-init_db()
+def as_dict(obj):
+    return {c.name:getattr(obj,c.name) for c in obj.__table__.columns}
 
 
-def check_scanner_secret(request: Request):
-    if SCANNER_SECRET and request.headers.get("X-Scanner-Secret") != SCANNER_SECRET:
-        raise HTTPException(401, "Invalid scanner secret")
+@app.get('/health')
+def health(): return {'status':'UP','service':'jft-dashboard','time':datetime.now(timezone.utc).isoformat()}
 
-
-@app.get("/", response_class=HTMLResponse)
+@app.get('/', response_class=HTMLResponse)
 def dashboard():
-    with open("static/index.html", "r", encoding="utf-8") as f:
-        return f.read()
+    with open('static/index.html','r',encoding='utf-8') as f: return f.read()
 
-
-@app.get("/api/signals")
+@app.get('/api/signals')
 def signals():
-    conn = db(); rows = conn.execute("SELECT * FROM signals ORDER BY id DESC LIMIT 500").fetchall(); conn.close()
-    return [dict(r) for r in rows]
+    with session() as db:
+        rows=db.scalars(select(Signal).order_by(desc(Signal.id)).limit(500)).all()
+        return [as_dict(x) for x in rows]
 
-
-@app.get("/api/stats")
+@app.get('/api/stats')
 def stats():
-    conn = db()
-    total = conn.execute("SELECT COUNT(*) c FROM signals").fetchone()["c"]
-    open_count = conn.execute("SELECT COUNT(*) c FROM signals WHERE status='OPEN'").fetchone()["c"]
-    closed = conn.execute("SELECT COUNT(*) c FROM signals WHERE status='CLOSED'").fetchone()["c"]
-    pnl = conn.execute("SELECT COALESCE(SUM(pnl),0) p FROM signals").fetchone()["p"]
-    wins = conn.execute("SELECT COUNT(*) c FROM signals WHERE status='CLOSED' AND pnl > 0").fetchone()["c"]
-    conn.close(); return {"total": total, "open": open_count, "closed": closed, "pnl": pnl, "win_rate": (wins / closed * 100) if closed else 0}
+    with session() as db:
+        total=db.scalar(select(func.count()).select_from(Signal)) or 0
+        open_count=db.scalar(select(func.count()).select_from(Signal).where(Signal.status=='OPEN')) or 0
+        closed=db.scalar(select(func.count()).select_from(Signal).where(Signal.status=='CLOSED')) or 0
+        pnl=db.scalar(select(func.coalesce(func.sum(Signal.pnl),0)).select_from(Signal)) or 0
+        wins=db.scalar(select(func.count()).select_from(Signal).where(Signal.status=='CLOSED',Signal.pnl>0)) or 0
+        return {'total':total,'open':open_count,'closed':closed,'pnl':float(pnl),'win_rate':wins/closed*100 if closed else 0}
 
+@app.get('/api/jft/levels')
+def get_levels(trade_date:str):
+    with session() as db:
+        rows=db.scalars(select(JFTLevel).where(JFTLevel.trade_date==trade_date).order_by(JFTLevel.symbol)).all()
+        return [as_dict(x) for x in rows]
 
-@app.get("/api/jft/levels")
-def get_levels(trade_date: str):
-    conn = db(); rows = conn.execute("SELECT * FROM jft_levels WHERE trade_date=?", (trade_date,)).fetchall(); conn.close()
-    return [dict(r) for r in rows]
+@app.post('/api/jft/levels')
+async def upsert_levels(request:Request):
+    check_secret(request); data=await request.json(); levels=data.get('levels',[])
+    with session() as db:
+        for x in levels:
+            row=db.scalar(select(JFTLevel).where(JFTLevel.trade_date==x['trade_date'],JFTLevel.symbol==x['symbol']))
+            if not row: row=JFTLevel(trade_date=x['trade_date'],symbol=x['symbol']); db.add(row)
+            for k in ('prev_high','prev_low','midpoint','r1','r2','r3','s1','s2','s3'): setattr(row,k,float(x[k]))
+        db.commit()
+    return {'ok':True,'count':len(levels)}
 
+@app.get('/api/scanner/state')
+def scanner_state(trade_date:str):
+    with session() as db:
+        rows=db.scalars(select(ScannerState).where(ScannerState.trade_date==trade_date)).all()
+        return {x.symbol:x.ltp for x in rows}
 
-@app.post("/api/jft/levels")
-async def upsert_levels(request: Request):
-    check_scanner_secret(request); data = await request.json(); levels = data.get("levels", [])
-    conn = db()
-    for x in levels:
-        conn.execute("""INSERT INTO jft_levels
-            (trade_date,symbol,prev_high,prev_low,midpoint,r1,r2,r3,s1,s2,s3)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(trade_date,symbol) DO UPDATE SET
-            prev_high=excluded.prev_high,prev_low=excluded.prev_low,midpoint=excluded.midpoint,
-            r1=excluded.r1,r2=excluded.r2,r3=excluded.r3,s1=excluded.s1,s2=excluded.s2,s3=excluded.s3""",
-            (x["trade_date"],x["symbol"],x["prev_high"],x["prev_low"],x["midpoint"],x["r1"],x["r2"],x["r3"],x["s1"],x["s2"],x["s3"]))
-    conn.commit(); conn.close(); return {"ok": True, "count": len(levels)}
+@app.post('/api/scanner/ltps')
+async def scanner_ltps(request:Request):
+    check_secret(request); data=await request.json(); trade_date=str(data['trade_date']); ltps=data.get('ltps',{}); now=datetime.now(timezone.utc).isoformat(); updated=0
+    with session() as db:
+        for symbol,value in ltps.items():
+            row=db.scalar(select(ScannerState).where(ScannerState.trade_date==trade_date,ScannerState.symbol==symbol))
+            if not row: row=ScannerState(trade_date=trade_date,symbol=symbol,ltp=float(value),updated_at=now); db.add(row)
+            else: row.ltp=float(value); row.updated_at=now
+            open_signals=db.scalars(select(Signal).where(Signal.symbol==symbol,Signal.status=='OPEN')).all()
+            for sig in open_signals:
+                sig.ltp=float(value); sig.pnl=(float(value)-sig.entry) if sig.side=='BUY' else (sig.entry-float(value)); sig.pnl_pct=sig.pnl/sig.entry*100; updated+=1
+        db.commit()
+    return {'ok':True,'symbols':len(ltps),'updated_signals':updated}
 
+@app.post('/api/scanner/signal')
+async def scanner_signal(request:Request):
+    check_secret(request); data=await request.json(); side=str(data.get('signal',data.get('side',''))).upper()
+    if side not in ('BUY','SELL'): raise HTTPException(400,'signal must be BUY or SELL')
+    required=('symbol','entry','r1','r2','r3','s1','s2','s3')
+    if any(k not in data for k in required): raise HTTPException(400,'Missing scanner signal fields')
+    symbol=str(data['symbol']); entry=float(data['entry'])
+    with session() as db:
+        existing=db.scalar(select(Signal).where(Signal.symbol==symbol,Signal.side==side,Signal.status=='OPEN').limit(1))
+        if existing: return {'ok':True,'duplicate':True,'id':existing.id}
+        sig=Signal(symbol=symbol,side=side,entry=entry,stop_loss=float(data['r2'] if side=='BUY' else data['s2']),r1=float(data['r1']),r2=float(data['r2']),r3=float(data['r3']),s1=float(data['s1']),s2=float(data['s2']),s3=float(data['s3']),ltp=float(data.get('ltp',entry)),pnl=0,pnl_pct=0,status='OPEN',timeframe=str(data.get('timeframe','5m')),signal_time=str(data.get('time',datetime.now(timezone.utc).isoformat())),created_at=datetime.now(timezone.utc).isoformat())
+        db.add(sig); db.commit(); db.refresh(sig)
+        return {'ok':True,'id':sig.id,'side':side,'entry':entry,'stop_loss':sig.stop_loss}
 
-@app.post("/api/scanner/ltps")
-async def scanner_ltps(request: Request):
-    check_scanner_secret(request); data = await request.json(); trade_date = str(data["trade_date"]); ltps = data.get("ltps", {})
-    now = datetime.now(timezone.utc).isoformat(); conn = db(); updated = 0
-    for symbol, value in ltps.items():
-        ltp = float(value)
-        conn.execute("""INSERT INTO scanner_state(trade_date,symbol,ltp,updated_at) VALUES (?,?,?,?)
-            ON CONFLICT(trade_date,symbol) DO UPDATE SET ltp=excluded.ltp,updated_at=excluded.updated_at""", (trade_date,symbol,ltp,now))
-        for r in conn.execute("SELECT * FROM signals WHERE symbol=? AND status='OPEN'", (symbol,)).fetchall():
-            pnl = (ltp-r["entry"]) if r["side"] == "BUY" else (r["entry"]-ltp); pnl_pct = pnl/r["entry"]*100
-            conn.execute("UPDATE signals SET ltp=?,pnl=?,pnl_pct=? WHERE id=?", (ltp,pnl,pnl_pct,r["id"])); updated += 1
-    conn.commit(); conn.close(); return {"ok": True, "symbols": len(ltps), "updated_signals": updated}
-
-
-@app.get("/api/scanner/state")
-def scanner_state(trade_date: str):
-    conn = db(); rows = conn.execute("SELECT symbol,ltp FROM scanner_state WHERE trade_date=?", (trade_date,)).fetchall(); conn.close()
-    return {r["symbol"]: r["ltp"] for r in rows}
-
-
-@app.post("/api/scanner/signal")
-async def scanner_signal(request: Request):
-    check_scanner_secret(request); data = await request.json(); side = str(data.get("signal", data.get("side", ""))).upper()
-    if side not in {"BUY", "SELL"}: raise HTTPException(400, "signal must be BUY or SELL")
-    required = ["symbol","entry","r1","r2","r3","s1","s2","s3"]
-    if any(k not in data for k in required): raise HTTPException(400, "Missing scanner signal fields")
-    symbol = str(data["symbol"]); entry = float(data["entry"]); r1,r2,r3 = float(data["r1"]),float(data["r2"]),float(data["r3"]); s1,s2,s3 = float(data["s1"]),float(data["s2"]),float(data["s3"])
-    stop_loss = r2 if side == "BUY" else s2; ltp = float(data.get("ltp",entry)); signal_time = str(data.get("time",datetime.now(timezone.utc).isoformat())); timeframe = str(data.get("timeframe","5m"))
-    conn = db(); existing = conn.execute("SELECT id FROM signals WHERE symbol=? AND side=? AND status='OPEN' LIMIT 1",(symbol,side)).fetchone()
-    if existing: conn.close(); return {"ok":True,"duplicate":True,"id":existing["id"]}
-    cur = conn.execute("""INSERT INTO signals
-        (symbol,side,entry,stop_loss,r1,r2,r3,s1,s2,s3,ltp,pnl,pnl_pct,status,timeframe,signal_time,created_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,0,0,'OPEN',?,?,?)""",
-        (symbol,side,entry,stop_loss,r1,r2,r3,s1,s2,s3,ltp,timeframe,signal_time,datetime.now(timezone.utc).isoformat()))
-    conn.commit(); signal_id=cur.lastrowid; conn.close(); return {"ok":True,"id":signal_id,"side":side,"entry":entry,"stop_loss":stop_loss}
-
-
-@app.post("/webhook/tradingview")
-async def tradingview_webhook(request: Request):
-    try: data = await request.json()
-    except Exception: raise HTTPException(400,"Webhook body must be JSON")
-    side=str(data.get("signal",data.get("side",""))).upper()
-    if side not in {"BUY","SELL"}: raise HTTPException(400,"signal must be BUY or SELL")
-    try:
-        entry=float(data.get("entry",data.get("price",data.get("close")))); r1=float(data["r1"]); r2=float(data["r2"]); s1=float(data["s1"]); s2=float(data["s2"])
-    except (KeyError,TypeError,ValueError): raise HTTPException(400,"Required fields: symbol, signal, price/entry, r1, r2, s1, s2")
-    symbol=str(data.get("symbol","UNKNOWN")); ltp=float(data.get("ltp",entry)); signal_time=str(data.get("time",datetime.now(timezone.utc).isoformat())); timeframe=str(data.get("timeframe",data.get("interval",""))); stop_loss=r1 if side=="BUY" else s1
-    conn=db(); existing=conn.execute("SELECT id FROM signals WHERE symbol=? AND side=? AND status='OPEN' LIMIT 1",(symbol,side)).fetchone()
-    if existing: conn.close(); return {"ok":True,"duplicate":True,"id":existing["id"]}
-    cur=conn.execute("""INSERT INTO signals
-        (symbol,side,entry,stop_loss,r1,r2,r3,s1,s2,s3,ltp,pnl,pnl_pct,status,timeframe,signal_time,created_at)
-        VALUES (?,?,?,?,?,?,NULL,?,?,NULL,?,0,0,'OPEN',?,?,?)""",(symbol,side,entry,stop_loss,r1,r2,s1,s2,ltp,timeframe,signal_time,datetime.now(timezone.utc).isoformat()))
-    conn.commit(); signal_id=cur.lastrowid; conn.close(); return {"ok":True,"id":signal_id,"side":side,"entry":entry,"stop_loss":stop_loss}
-
-
-@app.post("/api/ltp")
-async def update_ltp(request: Request):
-    data=await request.json(); symbol=str(data.get("symbol","")); ltp=float(data["ltp"]); conn=db(); rows=conn.execute("SELECT * FROM signals WHERE symbol=? AND status='OPEN'",(symbol,)).fetchall()
-    for r in rows:
-        pnl=(ltp-r["entry"]) if r["side"]=="BUY" else (r["entry"]-ltp); pnl_pct=pnl/r["entry"]*100; conn.execute("UPDATE signals SET ltp=?,pnl=?,pnl_pct=? WHERE id=?",(ltp,pnl,pnl_pct,r["id"]))
-    conn.commit(); conn.close(); return {"ok":True,"updated":len(rows)}
-
-
-@app.post("/api/signals/{signal_id}/close")
+@app.post('/api/signals/{signal_id}/close')
 async def close_signal(signal_id:int,request:Request):
-    data=await request.json(); ltp=float(data["ltp"]); conn=db(); r=conn.execute("SELECT * FROM signals WHERE id=?",(signal_id,)).fetchone()
-    if not r: conn.close(); raise HTTPException(404,"Signal not found")
-    pnl=(ltp-r["entry"]) if r["side"]=="BUY" else (r["entry"]-ltp); pnl_pct=pnl/r["entry"]*100; conn.execute("UPDATE signals SET ltp=?,pnl=?,pnl_pct=?,status='CLOSED' WHERE id=?",(ltp,pnl,pnl_pct,signal_id)); conn.commit(); conn.close(); return {"ok":True,"pnl":pnl,"pnl_pct":pnl_pct}
+    check_secret(request); data=await request.json(); ltp=float(data['ltp'])
+    with session() as db:
+        sig=db.get(Signal,signal_id)
+        if not sig: raise HTTPException(404,'Signal not found')
+        sig.ltp=ltp; sig.pnl=(ltp-sig.entry) if sig.side=='BUY' else (sig.entry-ltp); sig.pnl_pct=sig.pnl/sig.entry*100; sig.status='CLOSED'; db.commit(); return {'ok':True,'pnl':sig.pnl,'pnl_pct':sig.pnl_pct}
 
+@app.post('/webhook/tradingview')
+async def tradingview_webhook(request:Request):
+    data=await request.json(); side=str(data.get('signal',data.get('side',''))).upper()
+    if side not in ('BUY','SELL'): raise HTTPException(400,'signal must be BUY or SELL')
+    try:
+        symbol=str(data['symbol']); entry=float(data.get('entry',data.get('price',data['close']))); r1=float(data['r1']); r2=float(data['r2']); s1=float(data['s1']); s2=float(data['s2'])
+    except (KeyError,TypeError,ValueError): raise HTTPException(400,'Required fields: symbol, signal, price/entry, r1, r2, s1, s2')
+    with session() as db:
+        existing=db.scalar(select(Signal).where(Signal.symbol==symbol,Signal.side==side,Signal.status=='OPEN').limit(1))
+        if existing: return {'ok':True,'duplicate':True,'id':existing.id}
+        sig=Signal(symbol=symbol,side=side,entry=entry,stop_loss=r1 if side=='BUY' else s1,r1=r1,r2=r2,r3=None,s1=s1,s2=s2,s3=None,ltp=float(data.get('ltp',entry)),pnl=0,pnl_pct=0,status='OPEN',timeframe=str(data.get('timeframe',data.get('interval',''))),signal_time=str(data.get('time',datetime.now(timezone.utc).isoformat())),created_at=datetime.now(timezone.utc).isoformat()); db.add(sig); db.commit(); db.refresh(sig); return {'ok':True,'id':sig.id}
 
-app.mount("/static", StaticFiles(directory="static"), name="static")
+app.mount('/static',StaticFiles(directory='static'),name='static')
